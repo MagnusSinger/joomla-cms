@@ -8,7 +8,22 @@
 
 namespace Joomla\CMS\TUF;
 
-use Joomla\Plugin\System\Webauthn\Helper\Joomla;
+use JLoader;
+use Joomla\CMS\Factory;
+use Joomla\Database\DatabaseDriver;
+use Joomla\Database\ParameterType;
+use Symfony\Component\OptionsResolver\Exception\InvalidOptionsException;
+use Symfony\Component\OptionsResolver\Exception\UndefinedOptionsException;
+use Symfony\Component\OptionsResolver\OptionsResolver;
+use Tuf\Client\GuzzleFileFetcher;
+use Tuf\Client\Updater;
+use Tuf\Exception\Attack\FreezeAttackException;
+use Tuf\Exception\Attack\RollbackAttackException;
+use Tuf\Exception\Attack\SignatureThresholdException;
+use Tuf\Exception\MetadataException;
+use Tuf\JsonNormalizer;
+
+JLoader::registerNamespace('Tuf', JPATH_ROOT . '/libraries/src/TUF/src');
 
 \defined('JPATH_PLATFORM') or die;
 
@@ -17,63 +32,123 @@ use Joomla\Plugin\System\Webauthn\Helper\Joomla;
  */
 class TufValidation
 {
-	public function __construct($extensionId, $params)
-	{
+	/**
+	 * The id of the extension to be updated
+	 *
+	 * @var integer
+	 */
+	private int $extensionId;
 
+	/**
+	 * The params of the validator
+	 *
+	 * @var mixed
+	 */
+	private mixed $params;
+
+	/**
+	 * Validating updates with TUF
+	 *
+	 * @param   integer $extensionId  The ID of the extension to be checked
+	 * @param   mixed  $params  The parameters containing the Base-URI, the Metadata- and Targets-Path and mirrors for
+	 * the update
+	 */
+	public function __construct(int $extensionId, mixed $params)
+	{
+		$this->extensionId = $extensionId;
+
+		$resolver = new OptionsResolver;
+
+		try
+		{
+			$this->configureTufOptions($resolver);
+		}
+		catch (\Exception)
+		{
+		}
+
+		try
+		{
+			$params = $resolver->resolve($params);
+		}
+		catch (\Exception $e)
+		{
+			if ($e instanceof UndefinedOptionsException || $e instanceof InvalidOptionsException)
+			{
+				throw $e;
+			}
+		}
+
+		$this->params = $params;
 	}
 
-	public function getValidUpdate()
+	/**
+	 * Configures default values or pass arguments to params
+	 *
+	 * @param   OptionsResolver $resolver  The OptionsResolver for the params
+	 * @return void
+	 */
+	protected function configureTufOptions(OptionsResolver $resolver)
 	{
-		return json_decode('{
-            "description": "Joomla! 4.1 CMS",
-            "downloads": {
-              "downloadsource": [
-                {
-                  "url": "https://github.com/joomla/joomla-cms/releases/download/4.1.0/Joomla_4.1.0-Stable-Update_Package.zip",
-                  "format": "zip",
-                  "type": "full"
-                },
-                {
-                  "url": "https://update.joomla.org/releases/4.1.0/Joomla_4.1.0-Stable-Update_Package.zip",
-                  "format": "zip",
-                  "type": "full"
-                }
-              ],
-              "downloadurl": {
-                "url": "https://downloads.joomla.org/cms/joomla4/4-1-0/Joomla_4.1.0-Stable-Update_Package.zip",
-                "format": "zip",
-                "type": "full"
-              }
-            },
-            "element": "joomla",
-            "infourl": {
-              "url": "https://www.joomla.org/announcements/release-news/5855-joomla-4-1-0-stable-new-standards-in-accessible-website-design.html",
-              "title": "Joomla 4.1.0 Release"
-            },
-            "maintainer": "Joomla! Production Department",
-            "maintainerurl": "https://www.joomla.org",
-            "name": "Joomla! 4.1",
-            "php_minimum": "7.2.5",
-            "section": "STS",
-            "sha256": "2df84d3e5cc11f7ceec6848c3cea47962994c0dd0f12bcd745d30044a60437be",
-            "sha384": "81dcedf0adaf356c75b7a144ccf02c5760f683f9913b95ab8adc83169813acc0a11d411309c3d562c66bc7b2e3a38b77",
-            "sha512": "5d516078343f6d850ec095ffbad24d0fbd956090a40435a6fb8f66831408d603109f0c9634df9c3aca14202004d690a17a4b27fb26c7799e27d56dca190f808f",
-            "supported_databases": {
-              "mariadb": "10.1",
-              "mysql": "5.6",
-              "postgresql": "11.0",
-              "self-closing": "true"
-            },
-            "tags": {
-              "tag": "stable"
-            },
-            "targetplatform": {
-              "name": "joomla",
-              "self-closing": "true",
-              "version": "4.[01]"
-            },
-            "type": "file",
-            "version": "4.1.0"
-        }');
+		$resolver->setDefaults(
+			[
+				'url_prefix' => 'https://raw.githubusercontent.com',
+				'metadata_path' => '/joomla/updates/test/repository/',
+				'targets_path' => '/targets/',
+				'mirrors' => [],
+			]
+		)
+			->setAllowedTypes('url_prefix', 'string')
+			->setAllowedTypes('metadata_path', 'string')
+			->setAllowedTypes('targets_path', 'string')
+			->setAllowedTypes('mirrors', 'array');
+	}
+
+	/**
+	 * Checks for updates and writes it into the database if they are valid. Then it gets the targets.json content and
+	 * returns it
+	 *
+	 * @return mixed Returns the targets.json if the validation is successful, otherwise null
+	 */
+	public function getValidUpdate(): mixed
+	{
+		$db = Factory::getContainer()->get(DatabaseDriver::class);
+
+		// $db = Factory::getDbo();
+
+		$fileFetcher = GuzzleFileFetcher::createFromUri($this->params['url_prefix'], $this->params['metadata_path'], $this->params['targets_path']);
+		$updater = new Updater(
+			$fileFetcher,
+			$this->params['mirrors'],
+			new DatabaseStorage($db, $this->extensionId)
+		);
+
+		try
+		{
+			// Refresh the data if needed, it will be written inside the DB, then we fetch it afterwards and return it to
+			// the caller
+			$updater->refresh();
+			$query = $db->getQuery(true)
+				->select('targets_json')
+				->from($db->quoteName('#__tuf_metadata', 'map'))
+				->where($db->quoteName('map.id') . ' = :id')
+				->bind(':id', $this->extensionId, ParameterType::INTEGER);
+			$db->setQuery($query);
+
+			$resultArray = (array) $db->loadObject();
+
+			return JsonNormalizer::decode($resultArray['targets_json']);
+		}
+		catch (FreezeAttackException | MetadataException | SignatureThresholdException | RollbackAttackException $e)
+		{
+			// When the validation fails, for example when one file is written but the others don't, we roll back everything
+			// and cancel the update
+			$query = $db->getQuery(true)
+				->delete('#__tuf_metadata')
+				->columns(['snapshot_json', 'targets_json', 'timestamp_json']);
+			$db->setQuery($query);
+
+			return null;
+		}
 	}
 }
